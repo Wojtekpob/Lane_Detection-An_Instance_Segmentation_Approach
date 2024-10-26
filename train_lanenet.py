@@ -148,7 +148,7 @@ if __name__ == '__main__':
             if phase == 'train':
                 epoch += 1
                 if epoch % ckpt_epoch_interval == 0:
-                    ckpt_dir = 'check_point/ckpt_%s_%s' % (train_start_time, args.tag)
+                    ckpt_dir = 'data/check_point/ckpt_%s_%s' % (train_start_time, args.tag)
                     if os.path.exists(ckpt_dir) is False:
                         os.mkdir(ckpt_dir)
                     ckpt_path = os.path.join(ckpt_dir, 'ckpt_%s_epoch-%d.pth' % (train_start_time, epoch))
