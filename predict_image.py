@@ -1,84 +1,82 @@
-import argparse
 import os
-import numpy as np
-import cv2
+import argparse
 import torch
-import torch.nn as nn
-import model.lanenet as lanenet
-from model.utils import cluster_embed, fit_lanes, sample_from_curve, get_color
+import cv2
+import numpy as np
+import ujson as json
+from model import lanenet
+from model.utils import cluster_embed, fit_lanes, sample_from_curve, generate_json_entry, get_color
+from torchvision import transforms
 
 def init_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--image_path', type=str, help='path to input image for prediction')
-    parser.add_argument('--ckpt_path', type=str, required=True, help='path to model checkpoint (.pth)')
-    parser.add_argument('--arch', type=str, default='fcn', help='network architecture type (default: FCN)')
+    parser.add_argument('--image_path', type=str, help='path to the input image')
+    parser.add_argument('--ckpt_path', type=str, help='path to model checkpoint (.pth)')
+    parser.add_argument('--save_dir', type=str, help='directory to save results')
+    parser.add_argument('--arch', type=str, default='fcn', help='network architecture type(default: FCN)')
     parser.add_argument('--dual_decoder', action='store_true', help='use separate decoders for two branches')
-    parser.add_argument('--show', action='store_true', help='show the prediction visualization')
-    parser.add_argument('--save_img', type=str, help='path to save the output visualization')
+    parser.add_argument('--show', action='store_true', help='display the results')
+    parser.add_argument('--save_img', action='store_true', help='save visualization images')
     return parser.parse_args()
 
-def load_model(ckpt_path, arch, dual_decoder, device):
-    if 'fcn' in arch.lower():
+def preprocess_image(image_path, size=(512, 288), mean=np.array([103.939, 116.779, 123.68])):
+    image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(f"No image found at {image_path}")
+    image = cv2.resize(image, size, interpolation=cv2.INTER_LINEAR)
+    image = image.astype(np.float32)
+    image -= mean
+    image = np.transpose(image, (2, 0, 1))
+    return torch.from_numpy(image).float() / 255
+
+def main():
+    args = init_args()
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # Model initialization
+    arch = 'lanenet.LaneNet_FCN_Res'
+    if 'fcn' in args.arch.lower():
         arch = 'lanenet.LaneNet_FCN_Res'
-    elif 'enet' in arch.lower():
+    elif 'enet' in args.arch.lower():
         arch = 'lanenet.LaneNet_ENet'
-    elif 'icnet' in arch.lower():
+    elif 'icnet' in args.arch.lower():
         arch = 'lanenet.LaneNet_ICNet'
-    
-    arch = arch + '_1E2D' if dual_decoder else arch + '_1E1D'
-    print('Architecture:', arch)
-    
+
+    arch = arch + '_1E2D' if args.dual_decoder else arch + '_1E1D'
     net = eval(arch)()
-    net = nn.DataParallel(net)
+    net = torch.nn.DataParallel(net)
     net.to(device)
-    
-    checkpoint = torch.load(ckpt_path)
-    net.load_state_dict(checkpoint['model_state_dict'], strict=True)
     net.eval()
-    return net
 
-def preprocess_image(image_path, VGG_MEAN):
-    image = cv2.imread(image_path)
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image_rgb = cv2.resize(image_rgb, (512, 256))
-    image_rgb = image_rgb.astype(np.float32) - VGG_MEAN
-    image_tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).unsqueeze(0) / 255.0
-    return image_tensor
+    checkpoint = torch.load(args.ckpt_path, map_location=device)
+    net.load_state_dict(checkpoint['model_state_dict'], strict=True)
 
-def predict_single_image(image_path, model, device, VGG_MEAN, show=False, save_path=None):
-    input_tensor = preprocess_image(image_path, VGG_MEAN).to(device)
-    
+    input_tensor = preprocess_image(args.image_path)
+    input_batch = input_tensor.unsqueeze(0).to(device)
+
     with torch.no_grad():
-        embeddings, logit = model(input_tensor)
-        pred_bin = torch.argmax(logit, dim=1, keepdim=True).cpu().numpy().squeeze(0)
-        pred_inst = cluster_embed(embeddings, pred_bin, band_width=0.5)[0]
+        embeddings, logit = net(input_batch)
+        pred_bin_batch = torch.argmax(logit, dim=1, keepdim=True)
 
-        h, w = input_tensor.shape[2:]
-        rgb = cv2.imread(image_path)
-        rgb = cv2.resize(rgb, (w, h))
-        pred_bin_rgb = (pred_bin * 255).astype(np.uint8)
-        pred_inst_rgb = np.zeros_like(rgb)
+    if args.show or args.save_img:
+        input_rgb = ((input_tensor.cpu().numpy().transpose(1, 2, 0) * 255) + np.array([103.939, 116.779, 123.68])).astype(np.uint8)
+        pred_bin_rgb = (pred_bin_batch[0].repeat(3, 1, 1).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+        combined_img = cv2.addWeighted(input_rgb, 1, pred_bin_rgb, 0.5, 0)
 
-        for i in np.unique(pred_inst):
-            if i == 0:
-                continue
-            index = np.where(pred_inst == i)
-            pred_inst_rgb[index] = get_color(i)
-
-        overlay = cv2.addWeighted(rgb, 0.5, pred_inst_rgb, 0.5, 0)
-        if save_path:
-            cv2.imwrite(save_path, overlay)
-            print(f"Saved visualization to {save_path}")
-        
-        if show:
-            cv2.imshow("Lane Prediction", overlay)
+        if args.show:
+            cv2.imshow('Predicted Binary Image', pred_bin_rgb)
+            cv2.imshow('Overlay Input with Prediction', combined_img)
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
-if __name__ == '__main__':
-    args = init_args()
-    VGG_MEAN = np.array([103.939, 116.779, 123.68], dtype=np.float32)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if args.save_img:
+            cv2.imwrite(os.path.join(args.save_dir, 'input.jpg'), input_rgb)
+            cv2.imwrite(os.path.join(args.save_dir, 'binary_prediction.jpg'), pred_bin_rgb)
+            cv2.imwrite(os.path.join(args.save_dir, 'overlay.jpg'), combined_img)
 
-    model = load_model(args.ckpt_path, args.arch, args.dual_decoder, device)
-    predict_single_image(args.image_path, model, device, VGG_MEAN, show=args.show, save_path=args.save_img)
+if __name__ == '__main__':
+    main()
+
